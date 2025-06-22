@@ -17,7 +17,9 @@ A Flask-based API and web dashboard for visualizing stock data, computing correl
 
 ## 📁 Project Structure
 ├── app.py # Main Flask application
+
 ├── token_gen.py # Token generation and management utility
+
 ├── stock_correlations.py # Correlation logic (assumed separately implemented)
 
 ---
