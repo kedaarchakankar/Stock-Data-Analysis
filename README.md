@@ -32,6 +32,8 @@ Create a virtual environment (optional but recommended), then install:
 
 pip install flask matplotlib boto3 pandas
 
+You can do this either in your AWS EC2 instance or on a local machine.
+
 ### 2. 🔐 AWS Credentials
 Make sure your environment has valid AWS credentials to access S3. You can do this using:
 export AWS_ACCESS_KEY_ID=your-access-key
