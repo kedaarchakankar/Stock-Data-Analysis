@@ -28,7 +28,7 @@ A Flask-based API and web dashboard for visualizing stock data, computing correl
 
 ### 1. 📦 Install Requirements
 
-Create a virtual environment (optional), then install:
+Create a virtual environment (Optional), then install:
 
 pip install flask matplotlib boto3 pandas
 
