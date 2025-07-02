@@ -177,10 +177,12 @@ def admin_delete_token():
     delete_token(token_to_delete)
     return redirect(f"/admin?token={admin_token}")
 
-# Parses datetime string into datetime object with UTC timezone
-# Example testcse: 
+# Parses datetime string into datetime object with UTC timezone. 
+# This is necessary, since the user input from the browser is set to local timezone, and this function helps normalize the time zones between the token json data and browser timezones.
+# Example testcase: 
 # dt_str = "2023-10-27T10:00:00Z" # ISO 8601 with 'Z' for UTC
 # expected_dt = datetime(2023, 10, 27, 10, 0, 0, tzinfo=timezone.utc)
+# self.assertEqual(parse_iso_utc(dt_str), expected_dt)
 def parse_iso_utc(dt_str):
     if dt_str.endswith('Z'):
         dt_str = dt_str[:-1] + '+00:00'
