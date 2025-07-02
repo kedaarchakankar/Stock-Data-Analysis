@@ -177,6 +177,21 @@ def admin_delete_token():
     delete_token(token_to_delete)
     return redirect(f"/admin?token={admin_token}")
 
+# Parses datetime string into datetime object with UTC timezone. 
+# This is necessary, since the user input from the browser is set to local timezone, 
+# this function helps normalize the time zones between the token json data and browser timezones.
+# Example testcase: 
+# dt_str = "2023-10-27T10:00:00Z" # ISO 8601 with 'Z' for UTC
+# expected_dt = datetime(2023, 10, 27, 10, 0, 0, tzinfo=timezone.utc)
+# self.assertEqual(parse_iso_utc(dt_str), expected_dt)
+def parse_iso_utc(dt_str):
+    if dt_str.endswith('Z'):
+        dt_str = dt_str[:-1] + '+00:00'
+    dt = datetime.fromisoformat(dt_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 
 def require_api_token(func):
     @wraps(func)
@@ -194,8 +209,8 @@ def require_api_token(func):
                 continue
 
             try:
-                valid_from = datetime.fromisoformat(token["valid_from"].replace("Z", "+00:00"))
-                expires_at = datetime.fromisoformat(token["expires_at"].replace("Z", "+00:00"))
+                valid_from = parse_iso_utc(token["valid_from"]) 
+                expires_at = parse_iso_utc(token["expires_at"])
             except Exception:
                 return jsonify({"error": "Invalid timestamp format in token data"}), 500
 
@@ -332,7 +347,7 @@ def plot():
     return send_file(path, mimetype='image/png')
 
 @app.route('/<stock_symbol>_data')
-#@require_api_token
+@require_api_token
 def stock_data_plot(stock_symbol):
     # Define S3 parameters
     bucket_name = 'stonks-1'
@@ -388,6 +403,7 @@ def stock_data_plot(stock_symbol):
     return Response(buf.getvalue(), mimetype='image/png')
 
 @app.route("/correlations/<stock_symbol>", methods=["GET"])
+@require_api_token
 def stock_correlations(stock_symbol):
     try:
         num_stocks = int(request.args.get("top", 5))
@@ -437,6 +453,7 @@ def run_correlation_job(job_id, stock_symbol, num_stocks, min_date, max_date):
         job_results[job_id] = {"error": str(e)}
 
 @app.route('/correlation/submit', methods=['GET', 'POST'])
+@require_api_token
 def submit_correlation_job():
     stock_symbol = request.args.get("stock")
     if not stock_symbol:
