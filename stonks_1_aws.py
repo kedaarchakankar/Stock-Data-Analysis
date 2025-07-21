@@ -31,11 +31,15 @@ def download_stock_data(api_token, directory, num_stocks, access_key, secret_key
     os.makedirs(directory, exist_ok=True)
 
     for i in range(min(num_stocks, len(df)) if num_stocks != -1 else len(df)):
-        ticker = df['ticker'][i].lower()
+        try: 
+            try:
+                ticker = df['ticker'][i].lower()
+            except Exception as e:
+                print(f"Error accessing ticker at index {i}: {e}")
+                continue
+            
+            headers = {'Content-Type': 'application/json'}
 
-        headers = {'Content-Type': 'application/json'}
-
-        try:
             requestResponse = requests.get(
                 f"https://api.tiingo.com/tiingo/daily/{ticker}/prices?startDate=1970-01-02&token={api_token}", 
                 headers=headers,
@@ -48,17 +52,13 @@ def download_stock_data(api_token, directory, num_stocks, access_key, secret_key
 
             json_data = requestResponse.json()
 
-            if access_key and secret_key and bucket_name:
+            if bucket_name:
                 # If AWS credentials are provided, upload to S3
-                s3 = boto3.client(
-                    's3',
-                    aws_access_key_id=access_key,
-                    aws_secret_access_key=secret_key
-                )
+                s3 = boto3.client('s3')
                 try:
                     s3.put_object(
                         Bucket=bucket_name,
-                        Key=f"{ticker}_data.json",
+                        Key=f"stock_data/{ticker}_data.json",
                         Body=json.dumps(json_data, indent=4),
                         ContentType='application/json'
                     )
