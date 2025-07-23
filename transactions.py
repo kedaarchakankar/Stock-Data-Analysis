@@ -1,13 +1,14 @@
 import pandas as pd
 import json
+import numpy as np
+import boto3
 
-transactions = [
-    {"stock": "swim", "date": "2021-04-26", "action": "buy", "quantity": 10},
-    {"stock": "swim", "date": "2021-04-27", "action": "sell", "quantity": 5},
-    {"stock": "swim", "date": "2021-04-28", "action": "sell", "quantity": 10},
-    {"stock": "aapl", "date": "2021-04-26", "action": "buy", "quantity": 20},
-    {"stock": "aapl", "date": "2021-04-28", "action": "sell", "quantity": 5}
-]
+S3_BUCKET = 'stonks-1'
+S3_PREFIX = 'stock_data/'
+s3_client = boto3.client('s3')
+
+with open('transactions.json', 'r') as f:
+    transactions = json.load(f)
 
 holdings = {}
 
@@ -19,33 +20,57 @@ for tx in transactions:
 
     # Load stock data if not already loaded
     if stock not in holdings:
-        with open(f"{stock}_data.json", 'r') as f:
-            stock_data = json.load(f)
+        s3_key = f"{S3_PREFIX}{stock}_data.json"
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        stock_data = json.loads(obj['Body'].read().decode('utf-8'))
         df = pd.DataFrame(stock_data)
-        holdings[stock] = {'quantity': 0, 'df': df}
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values(by='date', ascending=False)
+
+        # Sort by ascending date to keep chronological order
+        df = df.sort_values(by='date').reset_index(drop=True)
+
+        cum_price_factors = np.zeros(len(df))
+        cum_factor = 1.0
+        # Iterate backwards for price adjustment factor (from newest to oldest)
+        for i in reversed(range(len(df))):
+            cum_factor *= df.loc[i, 'splitFactor']
+            cum_price_factors[i] = cum_factor
+
+        df['cumulativeFactor'] = cum_price_factors
+        df['adjustedOpen'] = df['open'] #* df['cumulativeFactor']
+
+        holdings[stock] = {
+            'adj_quantity': 0.0,
+            'df': df
+        }
 
     stock_df = holdings[stock]['df']
-
-    # Format date to match df
-    formatted_date = pd.to_datetime(date).strftime('%Y-%m-%dT00:00:00.000Z')
-    row = stock_df[stock_df['date'] == formatted_date]
+    date_parsed = pd.to_datetime(date).strftime('%Y-%m-%dT00:00:00.000Z')
+    row = stock_df[stock_df['date'] == date_parsed]
 
     if row.empty:
-        print(f"[ERROR] No data for {stock} on {formatted_date}")
+        print(f"[ERROR] No data for {stock} on {date}")
         continue
 
-    price = row.iloc[0]['open']
-    current_holding = holdings[stock]['quantity']
+    row_data = row.iloc[0]
+    #print(row_data)
+    price = row_data['adjustedOpen']
+    factor = row_data['cumulativeFactor']
+    adj_qty = holdings[stock]['adj_quantity']
+    raw_qty = adj_qty / factor  # Convert adjusted quantity to raw units
 
     if action == 'buy':
-        holdings[stock]['quantity'] += quantity
-        print(f"[{stock.upper()}] Bought {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['quantity']}")
+        new_adj = quantity * factor
+        holdings[stock]['adj_quantity'] += new_adj
+        print(f"[{stock.upper()}] Bought {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted)")
     elif action == 'sell':
-        if quantity > current_holding:
-            print(f"[ERROR] Cannot sell {quantity} shares of {stock.upper()} on {date}; only {current_holding} available.")
+        if quantity > raw_qty:
+            print(f"[ERROR] Cannot sell {quantity} shares of {stock.upper()} on {date}; only {raw_qty:.2f} available.")
             continue
-        holdings[stock]['quantity'] -= quantity
-        print(f"[{stock.upper()}] Sold {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['quantity']}")
+        sell_adj = quantity * factor
+        holdings[stock]['adj_quantity'] -= sell_adj
+        print(f"[{stock.upper()}] Sold {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted)")
     else:
         print(f"[ERROR] Invalid action '{action}' for {stock.upper()} on {date}.")
 
@@ -54,14 +79,13 @@ print("\nFinal Holdings Summary:")
 total_value = 0.0
 
 for stock, data in holdings.items():
-    quantity = data['quantity']
+    adj_qty = data['adj_quantity']
     df = data['df']
 
-    # Get latest price from last row of df
-    last_price = df.iloc[-1]['open']
-    holding_value = quantity * last_price
+    last_price = df.iloc[-1]['adjustedOpen']
+    holding_value = adj_qty * last_price
     total_value += holding_value
 
-    print(f"{stock.upper()}: {quantity} shares x ${last_price:.2f} = ${holding_value:.2f}")
+    print(f"{stock.upper()}: {adj_qty:.2f} shares x ${last_price:.2f} = ${holding_value:.2f}")
 
 print(f"\nTotal Portfolio Value: ${total_value:.2f}")
