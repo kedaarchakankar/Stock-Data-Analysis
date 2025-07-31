@@ -11,6 +11,7 @@ with open('transactions.json', 'r') as f:
     transactions = json.load(f)
 
 holdings = {}
+cash = 0.0
 
 for tx in transactions:
     stock = tx['stock']
@@ -61,18 +62,32 @@ for tx in transactions:
     raw_qty = adj_qty / factor  # Convert adjusted quantity to raw units
 
     if action == 'buy':
+        total_cost = price * quantity
         new_adj = quantity * factor
+
+        if total_cost > cash:
+            cash = 0
+        else:
+            cash -= total_cost
+
         holdings[stock]['adj_quantity'] += new_adj
-        print(f"[{stock.upper()}] Bought {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted)")
+        print(f"[{stock.upper()}] Bought {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted). Cash: ${cash:.2f}")
     elif action == 'sell':
         if quantity > raw_qty:
             print(f"[ERROR] Cannot sell {quantity} shares of {stock.upper()} on {date}; only {raw_qty:.2f} available.")
             continue
+
+        total_cost = price * quantity
+        cash += total_cost
         sell_adj = quantity * factor
+
         holdings[stock]['adj_quantity'] -= sell_adj
-        print(f"[{stock.upper()}] Sold {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted)")
+        print(f"[{stock.upper()}] Sold {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted). Cash: ${cash:.2f}")
     else:
         print(f"[ERROR] Invalid action '{action}' for {stock.upper()} on {date}.")
+
+    raw_holdings = holdings[stock]['adj_quantity'] / factor
+    print(f"[SUMMARY] Total {stock.upper()} holdings on {date}: {raw_holdings:.2f} (raw, unadjusted)")
 
 # Summary
 print("\nFinal Holdings Summary:")
