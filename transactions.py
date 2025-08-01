@@ -12,6 +12,8 @@ with open('transactions.json', 'r') as f:
 
 holdings = {}
 cash = 0.0
+total_input = 0.0
+print("Date, Stock, Action, Quantity, Total Stocks, Total Stock Value, Total Cash, Total Invested, Unadjusted")
 
 for tx in transactions:
     stock = tx['stock']
@@ -66,12 +68,17 @@ for tx in transactions:
         new_adj = quantity * factor
 
         if total_cost > cash:
+            total_input += total_cost - cash
             cash = 0
         else:
             cash -= total_cost
 
+
         holdings[stock]['adj_quantity'] += new_adj
-        print(f"[{stock.upper()}] Bought {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted). Cash: ${cash:.2f}")
+        raw_holdings = holdings[stock]['adj_quantity'] / factor
+        
+        print(f"{date}, {stock.upper()}, {action}, {quantity}, {raw_holdings:.2f}, {raw_holdings:.2f}, {cash:.2f}, {total_input:.2f}, {holdings[stock]['adj_quantity']:.2f}")
+        #print(f"[{stock.upper()}] Bought {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted). Cash: ${cash:.2f}. Invested: ${total_input:.2f}")
     elif action == 'sell':
         if quantity > raw_qty:
             print(f"[ERROR] Cannot sell {quantity} shares of {stock.upper()} on {date}; only {raw_qty:.2f} available.")
@@ -82,12 +89,15 @@ for tx in transactions:
         sell_adj = quantity * factor
 
         holdings[stock]['adj_quantity'] -= sell_adj
-        print(f"[{stock.upper()}] Sold {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted). Cash: ${cash:.2f}")
+        raw_holdings = holdings[stock]['adj_quantity'] / factor
+
+        print(f"{date}, {stock.upper()}, {action}, {quantity}, {raw_holdings:.2f}, {raw_holdings:.2f}, {cash:.2f}, {total_input:.2f}, {holdings[stock]['adj_quantity']:.2f}")
+        #print(f"[{stock.upper()}] Sold {quantity} shares on {date} at ${price:.2f}. Holdings: {holdings[stock]['adj_quantity']:.2f} (adjusted). Cash: ${cash:.2f}. Invested: ${total_input:.2f}")
     else:
         print(f"[ERROR] Invalid action '{action}' for {stock.upper()} on {date}.")
 
     raw_holdings = holdings[stock]['adj_quantity'] / factor
-    print(f"[SUMMARY] Total {stock.upper()} holdings on {date}: {raw_holdings:.2f} (raw, unadjusted)")
+    #print(f"[SUMMARY] Total {stock.upper()} holdings on {date}: {raw_holdings:.2f} (raw, unadjusted)")
 
 # Summary
 print("\nFinal Holdings Summary:")
