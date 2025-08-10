@@ -1,5 +1,9 @@
 # app.py
 from flask import Flask, send_file, render_template_string, Response, jsonify, request, redirect, url_for
+
+import matplotlib
+matplotlib.use('Agg')  # Must come before pyplot import
+
 import matplotlib.pyplot as plt
 import os
 import json
