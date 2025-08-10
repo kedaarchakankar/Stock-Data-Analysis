@@ -15,6 +15,7 @@ import threading
 import time
 from functools import wraps
 from token_gen import add_token, delete_token
+from transaction_logger import load_transactions, save_transaction
 
 
 app = Flask(__name__)
@@ -534,6 +535,91 @@ def get_job_status(job_id):
 @app.route('/routes')
 def list_routes():
     return jsonify([str(rule) for rule in app.url_map.iter_rules()])
+
+@app.route('/transactions', methods=['GET', 'POST'])
+def transactions():
+    if request.method == 'POST':
+        stock = request.form.get('stock', '').lower().strip()
+        date = request.form.get('date', '').strip()
+        action = request.form.get('action', '').lower().strip()
+        quantity = int(request.form.get('quantity', '0'))
+
+        if stock and date and action in ['buy', 'sell'] and quantity > 0:
+            new_tx = {
+                "stock": stock,
+                "date": date,
+                "action": action,
+                "quantity": quantity
+            }
+            save_transaction(new_tx)
+            return redirect(url_for('transactions'))
+
+    all_transactions = load_transactions()
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Log Stock Transaction</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="container mt-5">
+        <h2 class="mb-4">📋 Log a Stock Transaction</h2>
+        <form method="post" class="mb-5">
+            <div class="mb-3">
+                <label>Stock Symbol:</label>
+                <input type="text" name="stock" class="form-control" required>
+            </div>
+            <div class="mb-3">
+                <label>Date (YYYY-MM-DD):</label>
+                <input type="date" name="date" class="form-control" required>
+            </div>
+            <div class="mb-3">
+                <label>Action:</label>
+                <select name="action" class="form-select" required>
+                    <option value="buy">Buy</option>
+                    <option value="sell">Sell</option>
+                </select>
+            </div>
+            <div class="mb-3">
+                <label>Quantity:</label>
+                <input type="number" name="quantity" min="1" class="form-control" required>
+            </div>
+            <button type="submit" class="btn btn-primary">Submit</button>
+        </form>
+
+        <h3>📦 Existing Transactions</h3>
+        {% if transactions %}
+        <table class="table table-bordered table-striped">
+            <thead class="table-dark">
+                <tr>
+                    <th>#</th>
+                    <th>Stock</th>
+                    <th>Date</th>
+                    <th>Action</th>
+                    <th>Quantity</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for tx in transactions %}
+                <tr>
+                    <td>{{ loop.index }}</td>
+                    <td>{{ tx.stock.upper() }}</td>
+                    <td>{{ tx.date }}</td>
+                    <td class="{{ 'text-success' if tx.action == 'buy' else 'text-danger' }}">
+                        {{ tx.action.capitalize() }}
+                    </td>
+                    <td>{{ tx.quantity }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p>No transactions yet.</p>
+        {% endif %}
+    </body>
+    </html>
+    """, transactions=all_transactions)
+
 
 if __name__ == '__main__':
     os.makedirs('static', exist_ok=True)
