@@ -5,6 +5,8 @@ import numpy as np
 import boto3
 import io
 import sys
+from datetime import timedelta
+
 
 S3_BUCKET = 'stonks-1'
 S3_PREFIX = 'stock_data/'
@@ -23,7 +25,7 @@ def run_transactions():
     holdings = {}
     cash = 0.0
     total_input = 0.0
-    print("Date, Stock, Action, Quantity, Total Stocks, Total Stock Value, Total Cash, Total Invested, Unadjusted")
+    print("Date, Buy Date, Stock, Action, Quantity, Total Stocks, Total Stock Value, Total Cash, Total Invested, Unadjusted")
 
     for tx in transactions:
         stock = tx['stock']
@@ -55,11 +57,23 @@ def run_transactions():
             }
 
         stock_df = holdings[stock]['df']
-        date_parsed = pd.to_datetime(date).strftime('%Y-%m-%dT00:00:00.000Z')
-        row = stock_df[stock_df['date'] == date_parsed]
 
-        if row.empty:
-            print(f"[ERROR] No data for {stock} on {date}")
+        # Try up to 10 increments
+        date_dt = pd.to_datetime(date)
+
+        for i in range(11):  # includes the initial date (i=0)
+            date_parsed = date_dt.strftime('%Y-%m-%dT00:00:00.000Z')
+            row = stock_df[stock_df['date'] == date_parsed]
+
+            if not row.empty:
+                break  # found valid date, exit loop
+
+            # If not found, increment by 1 day
+            date_dt += timedelta(days=1)
+
+        else:
+            # Only runs if loop didn't break (no date found in 10 tries)
+            print(f"[ERROR] No data for {stock} from {date} within 10 days")
             continue
 
         row_data = row.iloc[0]
@@ -81,7 +95,7 @@ def run_transactions():
             holdings[stock]['adj_quantity'] += new_adj
             raw_holdings = holdings[stock]['adj_quantity'] / factor
 
-            print(f"{date}, {stock.upper()}, {action}, {quantity}, {price:.2f}, {raw_holdings:.2f}, {raw_holdings*price:.2f}, {cash:.2f}, {total_input:.2f}, {holdings[stock]['adj_quantity']:.2f}")
+            print(f"{date}, {date_dt.strftime('%Y-%m-%d')}, {stock.upper()}, {action}, {quantity}, {price:.2f}, {raw_holdings:.2f}, {raw_holdings*price:.2f}, {cash:.2f}, {total_input:.2f}, {holdings[stock]['adj_quantity']:.2f}")
 
         elif action == 'sell':
             if quantity > raw_qty:
@@ -95,7 +109,7 @@ def run_transactions():
             holdings[stock]['adj_quantity'] -= sell_adj
             raw_holdings = holdings[stock]['adj_quantity'] / factor
 
-            print(f"{date}, {stock.upper()}, {action}, {quantity}, {raw_holdings:.2f}, {raw_holdings:.2f}, {cash:.2f}, {total_input:.2f}, {holdings[stock]['adj_quantity']:.2f}")
+            print(f"{date}, {date_dt.strftime('%Y-%m-%d')}, {stock.upper()}, {action}, {quantity}, {raw_holdings:.2f}, {raw_holdings:.2f}, {cash:.2f}, {total_input:.2f}, {holdings[stock]['adj_quantity']:.2f}")
         else:
             print(f"[ERROR] Invalid action '{action}' for {stock.upper()} on {date}.")
 
@@ -114,7 +128,7 @@ def run_transactions():
     print(f"\nTotal Cash: ${cash:.2f}")
     print(f"\nTotal Money: ${total_value + cash:.2f}")
     print(f"\nTotal Invested: ${total_input:.2f}")
-    print(f"\nTotal Percentage gain: ${(total_value + cash) / total_input:.2f}")
+    print(f"\nTotal Percentage gain: {((total_value + cash) / total_input)*100 - 100:.2f}%")
 
 
     # Restore stdout and return captured output

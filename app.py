@@ -540,8 +540,8 @@ def get_job_status(job_id):
 def list_routes():
     return jsonify([str(rule) for rule in app.url_map.iter_rules()])
 
-@app.route('/transactions', methods=['GET', 'POST'])
-def transactions():
+@app.route('/execute_transactions', methods=['GET', 'POST'])
+def execute_transactions():
     if request.method == 'POST':
         stock = request.form.get('stock', '').lower().strip()
         date = request.form.get('date', '').strip()
