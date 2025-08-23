@@ -21,6 +21,8 @@ from functools import wraps
 from token_gen import add_token, delete_token
 from transaction_logger import load_transactions, save_transaction
 from datetime import timedelta
+from transactions import run_transactions
+
 
 
 
@@ -542,23 +544,30 @@ def get_job_status(job_id):
 def list_routes():
     return jsonify([str(rule) for rule in app.url_map.iter_rules()])
 
-@app.route('/execute_transactions', methods=['GET', 'POST'])
-def execute_transactions():
-    if request.method == 'POST':
-        stock = request.form.get('stock', '').lower().strip()
-        date = request.form.get('date', '').strip()
-        action = request.form.get('action', '').lower().strip()
-        quantity = int(request.form.get('quantity', '0'))
+@app.route('/transactions', methods=['GET', 'POST'])
+@require_api_token
+def transactions():
+    token = request.form.get('token') or request.args.get('token')
+    calculation_output = None
 
-        if stock and date and action in ['buy', 'sell'] and quantity > 0:
-            new_tx = {
-                "stock": stock,
-                "date": date,
-                "action": action,
-                "quantity": quantity
-            }
-            save_transaction(new_tx)
-            return redirect(url_for('transactions'))
+    if request.method == 'POST':
+        if 'calculate' in request.form:
+            calculation_output = run_transactions()
+        else:
+            stock = request.form.get('stock', '').lower().strip()
+            date = request.form.get('date', '').strip()
+            action = request.form.get('action', '').lower().strip()
+            quantity = int(request.form.get('quantity', '0'))
+
+            if stock and date and action in ['buy', 'sell'] and quantity > 0:
+                new_tx = {
+                    "stock": stock,
+                    "date": date,
+                    "action": action,
+                    "quantity": quantity
+                }
+                save_transaction(new_tx)
+                return redirect(url_for('transactions', token=token))
 
     all_transactions = load_transactions()
     return render_template_string("""
@@ -571,6 +580,7 @@ def execute_transactions():
     <body class="container mt-5">
         <h2 class="mb-4">📋 Log a Stock Transaction</h2>
         <form method="post" class="mb-5">
+            <input type="hidden" name="token" value="{{ token }}">
             <div class="mb-3">
                 <label>Stock Symbol:</label>
                 <input type="text" name="stock" class="form-control" required>
@@ -622,11 +632,23 @@ def execute_transactions():
         {% else %}
         <p>No transactions yet.</p>
         {% endif %}
+
+        <!-- Calculate button and output now BELOW the table -->
+        <form method="post" class="mb-3">
+            <input type="hidden" name="token" value="{{ token }}">
+            <button type="submit" name="calculate" class="btn btn-success">Calculate</button>
+        </form>
+
+        {% if calculation_output %}
+        <h3>📊 Calculation Output</h3>
+        <textarea class="form-control" rows="15" readonly>{{ calculation_output }}</textarea>
+        {% endif %}
     </body>
     </html>
-    """, transactions=all_transactions)
+    """, transactions=all_transactions[::-1], token=token, calculation_output=calculation_output)
 
 @app.route('/dca_rule', methods=['GET', 'POST'])
+@require_api_token
 def dca_rule():
     if request.method == 'POST':
         try:
