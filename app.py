@@ -20,6 +20,10 @@ import time
 from functools import wraps
 from token_gen import add_token, delete_token
 from transaction_logger import load_transactions, save_transaction
+from datetime import timedelta
+from transactions import run_transactions
+
+
 
 
 app = Flask(__name__)
@@ -540,23 +544,30 @@ def get_job_status(job_id):
 def list_routes():
     return jsonify([str(rule) for rule in app.url_map.iter_rules()])
 
-@app.route('/execute_transactions', methods=['GET', 'POST'])
-def execute_transactions():
-    if request.method == 'POST':
-        stock = request.form.get('stock', '').lower().strip()
-        date = request.form.get('date', '').strip()
-        action = request.form.get('action', '').lower().strip()
-        quantity = int(request.form.get('quantity', '0'))
+@app.route('/transactions', methods=['GET', 'POST'])
+@require_api_token
+def transactions():
+    token = request.form.get('token') or request.args.get('token')
+    calculation_output = None
 
-        if stock and date and action in ['buy', 'sell'] and quantity > 0:
-            new_tx = {
-                "stock": stock,
-                "date": date,
-                "action": action,
-                "quantity": quantity
-            }
-            save_transaction(new_tx)
-            return redirect(url_for('transactions'))
+    if request.method == 'POST':
+        if 'calculate' in request.form:
+            calculation_output = run_transactions()
+        else:
+            stock = request.form.get('stock', '').lower().strip()
+            date = request.form.get('date', '').strip()
+            action = request.form.get('action', '').lower().strip()
+            quantity = int(request.form.get('quantity', '0'))
+
+            if stock and date and action in ['buy', 'sell'] and quantity > 0:
+                new_tx = {
+                    "stock": stock,
+                    "date": date,
+                    "action": action,
+                    "quantity": quantity
+                }
+                save_transaction(new_tx)
+                return redirect(url_for('transactions', token=token))
 
     all_transactions = load_transactions()
     return render_template_string("""
@@ -569,6 +580,7 @@ def execute_transactions():
     <body class="container mt-5">
         <h2 class="mb-4">📋 Log a Stock Transaction</h2>
         <form method="post" class="mb-5">
+            <input type="hidden" name="token" value="{{ token }}">
             <div class="mb-3">
                 <label>Stock Symbol:</label>
                 <input type="text" name="stock" class="form-control" required>
@@ -620,10 +632,156 @@ def execute_transactions():
         {% else %}
         <p>No transactions yet.</p>
         {% endif %}
+
+        <!-- Calculate button and output now BELOW the table -->
+        <form method="post" class="mb-3">
+            <input type="hidden" name="token" value="{{ token }}">
+            <button type="submit" name="calculate" class="btn btn-success">Calculate</button>
+        </form>
+
+        {% if calculation_output %}
+        <h3>📊 Calculation Output</h3>
+        <textarea class="form-control" rows="15" readonly>{{ calculation_output }}</textarea>
+        {% endif %}
     </body>
     </html>
-    """, transactions=all_transactions)
+    """, transactions=all_transactions[::-1], token=token, calculation_output=calculation_output)
 
+@app.route('/dca_rule', methods=['GET', 'POST'])
+@require_api_token
+def dca_rule():
+    if request.method == 'POST':
+        try:
+            STOCK = request.form.get("stock", "aapl")
+            FIXED_DOLLAR_AMOUNT = float(request.form.get("dollar_amount", 100))
+            FREQUENCY = request.form.get("frequency", "weekly")
+            START_DATE = pd.to_datetime(request.form.get("start_date", "2020-01-01"), utc=True)
+            END_DATE   = pd.to_datetime(request.form.get("end_date", "2025-01-01"), utc=True)
+
+            # Load stock data from S3
+            S3_BUCKET = 'stonks-1'
+            S3_PREFIX = 'stock_data/'
+            s3_client = boto3.client('s3')
+            s3_key = f"{S3_PREFIX}{STOCK}_data.json"
+            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+            stock_data = json.loads(obj['Body'].read().decode('utf-8'))
+            df = pd.DataFrame(stock_data)
+            df['date'] = pd.to_datetime(df['date'], utc=True)
+            df = df.sort_values(by='date').reset_index(drop=True)
+
+            # Load existing transactions
+            with open('transactions.json', "r") as f:
+                transactions = json.load(f)
+
+            start_year = START_DATE.year
+            end_year = END_DATE.year
+
+            if FREQUENCY == 'monthly':
+                for year in range(start_year, end_year + 1):
+                    for month in range(1, 13):
+                        target_date = pd.Timestamp(year=year, month=month, day=1, tz='UTC')
+                        if target_date < df['date'].min() or target_date > df['date'].max():
+                            continue
+                        month_data = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
+                        if month_data.empty:
+                            continue
+                        date_lookup = month_data['date'].min()
+                        close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
+                        quantity = round(FIXED_DOLLAR_AMOUNT / close_price, 6)
+
+                        transactions.append({
+                            "stock": STOCK,
+                            "date": date_lookup.strftime("%Y-%m-%d"),
+                            "action": "buy",
+                            "quantity": quantity
+                        })
+
+            elif FREQUENCY == 'weekly':
+                first_sunday = START_DATE + pd.offsets.Week(weekday=6)
+                current_date = first_sunday
+                while current_date <= END_DATE:
+                    if current_date > df['date'].max():
+                        break
+                    week_data = df[df['date'] >= current_date]
+                    if week_data.empty:
+                        break
+                    date_lookup = week_data['date'].min()
+                    close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
+                    quantity = round(FIXED_DOLLAR_AMOUNT / close_price, 6)
+
+                    transactions.append({
+                        "stock": STOCK,
+                        "date": date_lookup.strftime("%Y-%m-%d"),
+                        "action": "buy",
+                        "quantity": quantity
+                    })
+
+                    current_date += timedelta(weeks=1)
+
+            # Save back
+            with open('transactions.json', "w") as f:
+                json.dump(transactions, f, indent=2)
+
+            message = f"Added {FREQUENCY} buys of ${FIXED_DOLLAR_AMOUNT} for {STOCK}"
+        except Exception as e:
+            message = f"Error: {str(e)}"
+
+        return render_template_string(UI_TEMPLATE, message=message)
+
+    # GET request → show the form
+    return render_template_string(UI_TEMPLATE, message=None)
+
+
+# Inline HTML UI
+UI_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Add DCA Rule</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    form { display: flex; flex-direction: column; width: 300px; }
+    label { margin-top: 10px; }
+    button { margin-top: 20px; padding: 10px; background: #4CAF50; color: white; border: none; cursor: pointer; }
+    button:hover { background: #45a049; }
+    .msg { margin-top: 20px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>Add DCA Investment Rule</h2>
+  <form method="POST">
+    <label>Stock Symbol:
+      <input type="text" name="stock" value="aapl" required>
+    </label>
+
+    <label>Dollar Amount:
+      <input type="number" name="dollar_amount" value="100" required>
+    </label>
+
+    <label>Frequency:
+      <select name="frequency">
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+      </select>
+    </label>
+
+    <label>Start Date:
+      <input type="date" name="start_date" value="2020-01-01" required>
+    </label>
+
+    <label>End Date:
+      <input type="date" name="end_date" value="2025-01-01" required>
+    </label>
+
+    <button type="submit">Apply Rule</button>
+  </form>
+
+  {% if message %}
+  <div class="msg">{{ message }}</div>
+  {% endif %}
+</body>
+</html>
+"""
 
 if __name__ == '__main__':
     os.makedirs('static', exist_ok=True)
