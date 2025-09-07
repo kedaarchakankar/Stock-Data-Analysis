@@ -14,8 +14,8 @@ transaction_log = []
 STOCK='aapl'
 FIXED_DOLLAR_AMOUNT = 100
 FREQUENCY = 'weekly'
-START_DATE = ''
-END_DATE = ''
+START_DATE = pd.to_datetime("2020-01-01", utc=True)
+END_DATE   = pd.to_datetime("2025-01-01", utc=True)
 
 
 s3_key = f"{S3_PREFIX}{STOCK}_data.json"
@@ -33,8 +33,8 @@ for i in reversed(range(len(df))):
 df['cumulativeFactor'] = cum_price_factors
 
 # Start from the first available trading date
-start_year = df['date'].min().year
-end_year = df['date'].max().year
+start_year = START_DATE.year
+end_year = END_DATE.year
 
 with open('transactions.json', "r") as f:
     transactions = json.load(f)
@@ -68,8 +68,8 @@ if (FREQUENCY == 'monthly'):
                 "quantity": quantity
             })
 elif(FREQUENCY == 'weekly'):
-    start_date = df['date'].min()
-    end_date = df['date'].max()
+    start_date = START_DATE
+    end_date = END_DATE
 
     first_sunday = start_date + pd.offsets.Week(weekday=6)  # 6 = Sunday
     current_date = first_sunday
