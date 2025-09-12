@@ -125,7 +125,7 @@ for stock, data in holdings.items():
     total_value += holding_value
     print(f"{stock.upper()}: {adj_qty:.2f} shares x ${last_price:.2f} = ${holding_value:.2f}")
 
-#print(f"\nTotal Portfolio Value: ${total_value:.2f}")
+#(f"\nTotal Portfolio Value: ${total_value:.2f}")
 #print(f"\nTotal Cash: ${cash:.2f}")
 #print(f"\nTotal Money: ${total_value + cash:.2f}")
 #print(f"\nTotal Invested: ${total_input:.2f}")
@@ -172,7 +172,7 @@ for current_date in date_range:
     # Process any transactions on this date
     while tx_idx < len(tx_sorted) and tx_sorted.loc[tx_idx, "Date"].date() == current_date.date():
         row = tx_sorted.loc[tx_idx]
-        stock = row["Stock"]
+        stock = row["Stock"].lower()
         action = row["Action"]
         quantity = row["Quantity"]
         price = row["Price"]
@@ -180,7 +180,17 @@ for current_date in date_range:
 
         # Find factor for this date from holdings data
         stock_df = holdings[stock]['df']
-        factor = stock_df.loc[stock_df["date"] == pd.Timestamp(row["Buy Date"]), "cumulativeFactor"].values[0]
+        buy_date = pd.to_datetime(row["Buy Date"]).tz_localize(None)  # remove tz if present
+
+        # Filter stock_df to dates <= buy_date
+        valid_dates = stock_df[stock_df["date"].dt.tz_localize(None) <= buy_date]
+
+        if valid_dates.empty:
+            raise ValueError(f"No stock price data available on or before {buy_date} for {stock}")
+
+        # Take the latest available date before or equal to buy_date
+        closest_row = valid_dates.iloc[-1]
+        factor = closest_row["cumulativeFactor"]
 
         if action == "buy":
             total_cost = price * quantity
@@ -236,6 +246,6 @@ plot_key = f"transactions/portfolio_plot.png"
 s3_client.put_object(
     Bucket=S3_BUCKET,
     Key=plot_key,
-    Body=img_buffer,
+    Body=img_buffer.getvalue(),
     ContentType="image/png"
 )

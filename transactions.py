@@ -13,14 +13,14 @@ S3_PREFIX = 'stock_data/'
 s3_client = boto3.client('s3')
 
 
-def run_transactions():
+def run_transactions(transactions_key):
     # Capture print output
     buffer = io.StringIO()
     sys_stdout = sys.stdout
     sys.stdout = buffer
 
-    with open('transactions.json', 'r') as f:
-        transactions = json.load(f)
+    obj = s3_client.get_object(Bucket=S3_BUCKET, Key=transactions_key)
+    transactions = json.loads(obj['Body'].read().decode('utf-8'))
 
     holdings = {}
     cash = 0.0

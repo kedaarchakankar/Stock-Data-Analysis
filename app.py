@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, send_file, render_template_string, Response, jsonify, request, redirect, url_for
+from flask import Flask, send_file, render_template_string, Response, jsonify, request, redirect, url_for, g
 
 import matplotlib
 matplotlib.use('Agg')  # Must come before pyplot import
@@ -544,15 +544,42 @@ def get_job_status(job_id):
 def list_routes():
     return jsonify([str(rule) for rule in app.url_map.iter_rules()])
 
+
 @app.route('/transactions', methods=['GET', 'POST'])
 @require_api_token
 def transactions():
+    s3_client = boto3.client('s3')
+    S3_BUCKET = "stonks-1"
     token = request.form.get('token') or request.args.get('token')
     calculation_output = None
 
-    if request.method == 'POST':
+    # --- Identify user & directory ---
+    user_id = request.token_info.get("username")
+    user_prefix = f"user_data/{user_id}/tx/"
+
+    # --- List available files ---
+    existing_files = []
+    resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=user_prefix)
+    if "Contents" in resp:
+        existing_files = [obj["Key"].split("/")[-1] for obj in resp["Contents"]]
+
+    # --- Selected or new file ---
+    selected_file = request.form.get("selected_file") or request.args.get("selected_file")
+    new_file = request.form.get("new_file")
+
+    if new_file:  # user creating new file
+        selected_file = new_file if new_file.endswith(".json") else f"{new_file}.json"
+        s3_client.put_object(Bucket=S3_BUCKET, Key=f"{user_prefix}{selected_file}", Body="[]")
+
+    if not selected_file and existing_files:  # default: first file if exists
+        selected_file = existing_files[0]
+
+    transactions_key = f"{user_prefix}{selected_file}" if selected_file else None
+
+    # --- Handle POST actions ---
+    if request.method == 'POST' and transactions_key:
         if 'calculate' in request.form:
-            calculation_output = run_transactions()
+            calculation_output = run_transactions(transactions_key)
         else:
             stock = request.form.get('stock', '').lower().strip()
             date = request.form.get('date', '').strip()
@@ -566,10 +593,13 @@ def transactions():
                     "action": action,
                     "quantity": quantity
                 }
-                save_transaction(new_tx)
-                return redirect(url_for('transactions', token=token))
+                save_transaction(S3_BUCKET, transactions_key, new_tx)
+                return redirect(url_for('transactions', token=token, selected_file=selected_file))
 
-    all_transactions = load_transactions()
+    # --- Load transactions ---
+    all_transactions = load_transactions(S3_BUCKET, transactions_key) if transactions_key else []
+
+    # --- Render ---
     return render_template_string("""
     <!DOCTYPE html>
     <html>
@@ -579,8 +609,30 @@ def transactions():
     </head>
     <body class="container mt-5">
         <h2 class="mb-4">📋 Log a Stock Transaction</h2>
+
+        <!-- File selection -->
+        <form method="post" class="mb-4">
+            <input type="hidden" name="token" value="{{ token }}">
+            <div class="mb-3">
+                <label>Select Transactions File:</label>
+                <select name="selected_file" class="form-select" onchange="this.form.submit()">
+                    {% for f in existing_files %}
+                    <option value="{{ f }}" {% if f == selected_file %}selected{% endif %}>{{ f }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="mb-3">
+                <label>Or Create New File:</label>
+                <input type="text" name="new_file" placeholder="filename.json" class="form-control">
+            </div>
+            <button type="submit" class="btn btn-secondary">Open/Create File</button>
+        </form>
+
+        {% if selected_file %}
+        <!-- Transaction Form -->
         <form method="post" class="mb-5">
             <input type="hidden" name="token" value="{{ token }}">
+            <input type="hidden" name="selected_file" value="{{ selected_file }}">
             <div class="mb-3">
                 <label>Stock Symbol:</label>
                 <input type="text" name="stock" class="form-control" required>
@@ -603,7 +655,8 @@ def transactions():
             <button type="submit" class="btn btn-primary">Submit</button>
         </form>
 
-        <h3>📦 Existing Transactions</h3>
+        <!-- Transaction Table -->
+        <h3>📦 Existing Transactions ({{ selected_file }})</h3>
         {% if transactions %}
         <table class="table table-bordered table-striped">
             <thead class="table-dark">
@@ -633,9 +686,10 @@ def transactions():
         <p>No transactions yet.</p>
         {% endif %}
 
-        <!-- Calculate button and output now BELOW the table -->
+        <!-- Calculate -->
         <form method="post" class="mb-3">
             <input type="hidden" name="token" value="{{ token }}">
+            <input type="hidden" name="selected_file" value="{{ selected_file }}">
             <button type="submit" name="calculate" class="btn btn-success">Calculate</button>
         </form>
 
@@ -643,9 +697,17 @@ def transactions():
         <h3>📊 Calculation Output</h3>
         <textarea class="form-control" rows="15" readonly>{{ calculation_output }}</textarea>
         {% endif %}
+        {% else %}
+        <p>Please select or create a transactions file first.</p>
+        {% endif %}
     </body>
     </html>
-    """, transactions=all_transactions[::-1], token=token, calculation_output=calculation_output)
+    """, 
+    transactions=all_transactions[::-1], 
+    token=token, 
+    calculation_output=calculation_output,
+    existing_files=existing_files,
+    selected_file=selected_file)
 
 @app.route('/dca_rule', methods=['GET', 'POST'])
 @require_api_token
@@ -669,9 +731,8 @@ def dca_rule():
             df['date'] = pd.to_datetime(df['date'], utc=True)
             df = df.sort_values(by='date').reset_index(drop=True)
 
-            # Load existing transactions
-            with open('transactions.json', "r") as f:
-                transactions = json.load(f)
+            # Initialize new transaction list
+            transactions = []
 
             start_year = START_DATE.year
             end_year = END_DATE.year
@@ -718,11 +779,39 @@ def dca_rule():
 
                     current_date += timedelta(weeks=1)
 
-            # Save back
-            with open('transactions.json', "w") as f:
-                json.dump(transactions, f, indent=2)
+            # Save transactions to S3
+            user_id = request.token_info.get("username")  # comes from the token
 
-            message = f"Added {FREQUENCY} buys of ${FIXED_DOLLAR_AMOUNT} for {STOCK}"
+            file_id = str(uuid.uuid4())
+            file_id_tx = file_id + "_tx.json"
+            user_s3_key = f"user_data/{user_id}/tx/{file_id_tx}"
+
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=user_s3_key,
+                Body=json.dumps(transactions, indent=2),
+                ContentType="application/json"
+            )
+
+            rule_dca = {
+                "stock": STOCK,
+                'fixed_dollar_amount': FIXED_DOLLAR_AMOUNT,
+                "frequency": FREQUENCY, 
+                "start_date": str(START_DATE), 
+                "end_date": str(END_DATE)  
+            }
+
+            file_id_dca = file_id + "_dca.json"
+            user_s3_key = f"user_data/{user_id}/dca/{file_id_dca}"
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=user_s3_key,
+                Body=json.dumps([rule_dca], indent=2),
+                ContentType="application/json"
+            )
+
+            message = f"Saved {len(transactions)} {FREQUENCY} buys of ${FIXED_DOLLAR_AMOUNT} for {STOCK} to {user_s3_key}"
+
         except Exception as e:
             message = f"Error: {str(e)}"
 
