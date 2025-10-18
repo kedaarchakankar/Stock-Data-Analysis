@@ -606,6 +606,7 @@ def transactions():
     S3_BUCKET = "stonks-1"
     token = request.form.get('token') or request.args.get('token')
     calculation_output = None
+    transaction_plot = None  # <--- now holds base64 image string
 
     # --- Identify user & directory ---
     user_id = request.token_info.get("username")
@@ -634,6 +635,12 @@ def transactions():
     if request.method == 'POST' and transactions_key:
         if 'calculate' in request.form:
             calculation_output = run_transactions(transactions_key)
+
+            # generate portfolio plot only when calculating
+            from transaction_plot import generate_transaction_plot
+            transaction_plot = generate_transaction_plot(transactions_key)
+            print(transaction_plot[:100])
+
         else:
             stock = request.form.get('stock', '').lower().strip()
             date = request.form.get('date', '').strip()
@@ -751,6 +758,12 @@ def transactions():
         <h3>📊 Calculation Output</h3>
         <textarea class="form-control" rows="15" readonly>{{ calculation_output }}</textarea>
         {% endif %}
+
+        {% if transaction_plot %}
+        <h3>📈 Portfolio Plot</h3>
+        <img src="data:image/png;base64,{{ transaction_plot }}" alt="Portfolio Plot" class="img-fluid mt-3">
+        {% endif %}
+
         {% else %}
         <p>Please select or create a transactions file first.</p>
         {% endif %}
@@ -761,7 +774,10 @@ def transactions():
     token=token, 
     calculation_output=calculation_output,
     existing_files=existing_files,
-    selected_file=selected_file)
+    selected_file=selected_file,
+    transaction_plot=transaction_plot)
+
+
 
 @app.route('/dca_rule', methods=['GET', 'POST'])
 @require_api_token
@@ -865,6 +881,8 @@ def dca_rule():
             )
 
             message = f"Saved {len(transactions)} {FREQUENCY} buys of ${FIXED_DOLLAR_AMOUNT} for {STOCK} to {user_s3_key}"
+            token = request.form.get("token") or request.args.get("token")
+            return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
 
         except Exception as e:
             message = f"Error: {str(e)}"
@@ -1030,6 +1048,8 @@ def fqr_rule():
             )
 
             message = f"Saved {len(transactions)} {FREQUENCY} buys of {FIXED_QUANTITY} shares for {STOCK} to {user_s3_key}"
+            token = request.form.get("token") or request.args.get("token")
+            return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
 
         except Exception as e:
             message = f"Error: {str(e)}"
