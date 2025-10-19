@@ -310,30 +310,84 @@ def correlation_input():
 
 @app.route('/')
 def home():
-    return render_template_string('''
+    token = request.args.get('token', '')
+
+    return render_template_string("""
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8">
+        <meta charset="utf-8">
         <title>Stonk Analysis Home</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     </head>
     <body class="bg-light">
-        <div class="container mt-5">
-            <h1 class="text-center mb-4">📊 Stonk Analysis Dashboard</h1>
+      <div class="container mt-5">
+        <h1 class="text-center mb-4">📊 Stonk Analysis Dashboard</h1>
 
-            <div class="d-grid gap-3 col-6 mx-auto">
-                <a href="/stock_input" class="btn btn-primary btn-lg">📈 View Stock Data</a>
-                <a href="/correlation_input" class="btn btn-success btn-lg">🔗 Check Stock Correlations</a>
-            </div>
-
-            <div class="text-center mt-5">
-                <p class="text-muted">More features coming soon...</p>
-            </div>
+        <div class="row justify-content-center mb-4">
+          <div class="col-md-8">
+            <form method="get" action="/">
+              <div class="input-group">
+                <input type="text" name="token" class="form-control" placeholder="Enter API token" value="{{ token }}">
+                <button class="btn btn-primary" type="submit">Use Token</button>
+              </div>
+              <div class="form-text mt-1">Protected endpoints will only appear after entering a valid token.</div>
+            </form>
+          </div>
         </div>
+
+        {% if token %}
+        <!-- Automated Rules & Transactions section -->
+        <div class="row justify-content-center">
+          <div class="col-md-10">
+            <div class="card mb-4 shadow">
+              <div class="card-body">
+                <h3 class="card-title">Automated Rules & Transactions</h3>
+                <p class="card-text">Access the rule creators and your transactions (requires a valid token).</p>
+                <div class="d-grid gap-2">
+                  <a class="btn btn-success btn-lg" href="{{ url_for('dca_rule', token=token) }}">💵 Add DCA Rule (dca_rule)</a>
+                  <a class="btn btn-success btn-lg" href="{{ url_for('fqr_rule', token=token) }}">🔢 Add Fixed Quantity Rule (fqr_rule)</a>
+                  <a class="btn btn-warning btn-lg" href="{{ url_for('transactions', token=token) }}">📋 Transactions (transactions)</a>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Data & Tools section -->
+        <div class="row justify-content-center">
+          <div class="col-md-10">
+            <div class="card mb-4 shadow">
+              <div class="card-body">
+                <h3 class="card-title">Data & Tools</h3>
+                <p class="card-text">Quick links to explore stock data and correlations.</p>
+                <div class="d-grid gap-2">
+                  <a class="btn btn-outline-primary btn-lg" href="{{ url_for('stock_input', token=token) }}">📈 View / Enter Stock (stock_input)</a>
+                  <a class="btn btn-outline-secondary btn-lg" href="{{ url_for('correlation_input', token=token) }}">🔗 Check Correlations (correlation_input)</a>
+                  <a class="btn btn-outline-info btn-lg" href="{{ url_for('plot', token=token) }}">📉 Simple Plot (plot)</a>
+                  <a class="btn btn-outline-dark btn-lg" href="{{ url_for('stock_data_plot', stock_symbol='AAPL', token=token) }}">🔎 Example: AAPL Data (AAPL_data)</a>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Extra link -->
+        <div class="row">
+          <div class="col-md-12 text-center">
+            <a href="{{ url_for('list_routes') }}" class="mt-3 d-inline-block">View app routes (routes)</a>
+          </div>
+        </div>
+        {% endif %}
+
+        <div class="text-center mt-4 text-muted">
+          <small>Note: protected endpoints verify tokens via <code>request.args.get('token')</code> or <code>X-API-TOKEN</code> header.</small>
+        </div>
+      </div>
     </body>
     </html>
-    ''')
+    """, token=token)
+
 
 @app.route('/plot')
 @require_api_token
@@ -552,6 +606,7 @@ def transactions():
     S3_BUCKET = "stonks-1"
     token = request.form.get('token') or request.args.get('token')
     calculation_output = None
+    transaction_plot = None  # <--- now holds base64 image string
 
     # --- Identify user & directory ---
     user_id = request.token_info.get("username")
@@ -580,6 +635,12 @@ def transactions():
     if request.method == 'POST' and transactions_key:
         if 'calculate' in request.form:
             calculation_output = run_transactions(transactions_key)
+
+            # generate portfolio plot only when calculating
+            from transaction_plot import generate_transaction_plot
+            transaction_plot = generate_transaction_plot(transactions_key)
+            print(transaction_plot[:100])
+
         else:
             stock = request.form.get('stock', '').lower().strip()
             date = request.form.get('date', '').strip()
@@ -697,6 +758,12 @@ def transactions():
         <h3>📊 Calculation Output</h3>
         <textarea class="form-control" rows="15" readonly>{{ calculation_output }}</textarea>
         {% endif %}
+
+        {% if transaction_plot %}
+        <h3>📈 Portfolio Plot</h3>
+        <img src="data:image/png;base64,{{ transaction_plot }}" alt="Portfolio Plot" class="img-fluid mt-3">
+        {% endif %}
+
         {% else %}
         <p>Please select or create a transactions file first.</p>
         {% endif %}
@@ -707,7 +774,10 @@ def transactions():
     token=token, 
     calculation_output=calculation_output,
     existing_files=existing_files,
-    selected_file=selected_file)
+    selected_file=selected_file,
+    transaction_plot=transaction_plot)
+
+
 
 @app.route('/dca_rule', methods=['GET', 'POST'])
 @require_api_token
@@ -811,6 +881,8 @@ def dca_rule():
             )
 
             message = f"Saved {len(transactions)} {FREQUENCY} buys of ${FIXED_DOLLAR_AMOUNT} for {STOCK} to {user_s3_key}"
+            token = request.form.get("token") or request.args.get("token")
+            return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
 
         except Exception as e:
             message = f"Error: {str(e)}"
@@ -845,6 +917,173 @@ UI_TEMPLATE = """
 
     <label>Dollar Amount:
       <input type="number" name="dollar_amount" value="100" required>
+    </label>
+
+    <label>Frequency:
+      <select name="frequency">
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+      </select>
+    </label>
+
+    <label>Start Date:
+      <input type="date" name="start_date" value="2020-01-01" required>
+    </label>
+
+    <label>End Date:
+      <input type="date" name="end_date" value="2025-01-01" required>
+    </label>
+
+    <button type="submit">Apply Rule</button>
+  </form>
+
+  {% if message %}
+  <div class="msg">{{ message }}</div>
+  {% endif %}
+</body>
+</html>
+"""
+
+@app.route('/fqr_rule', methods=['GET', 'POST'])
+@require_api_token
+def fqr_rule():
+    if request.method == 'POST':
+        try:
+            STOCK = request.form.get("stock", "aapl")
+            FIXED_QUANTITY = float(request.form.get("quantity", 1))
+            FREQUENCY = request.form.get("frequency", "weekly")
+            START_DATE = pd.to_datetime(request.form.get("start_date", "2020-01-01"), utc=True)
+            END_DATE   = pd.to_datetime(request.form.get("end_date", "2025-01-01"), utc=True)
+
+            # Load stock data from S3
+            S3_BUCKET = 'stonks-1'
+            S3_PREFIX = 'stock_data/'
+            s3_client = boto3.client('s3')
+            s3_key = f"{S3_PREFIX}{STOCK}_data.json"
+            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+            stock_data = json.loads(obj['Body'].read().decode('utf-8'))
+            df = pd.DataFrame(stock_data)
+            df['date'] = pd.to_datetime(df['date'], utc=True)
+            df = df.sort_values(by='date').reset_index(drop=True)
+
+            # Initialize new transaction list
+            transactions = []
+
+            start_year = START_DATE.year
+            end_year = END_DATE.year
+
+            if FREQUENCY == 'monthly':
+                for year in range(start_year, end_year + 1):
+                    for month in range(1, 13):
+                        target_date = pd.Timestamp(year=year, month=month, day=1, tz='UTC')
+                        if target_date < df['date'].min() or target_date > df['date'].max():
+                            continue
+                        month_data = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
+                        if month_data.empty:
+                            continue
+                        date_lookup = month_data['date'].min()
+                        close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
+
+                        transactions.append({
+                            "stock": STOCK,
+                            "date": date_lookup.strftime("%Y-%m-%d"),
+                            "action": "buy",
+                            "quantity": FIXED_QUANTITY,
+                            "price": close_price,
+                            "total_cost": round(FIXED_QUANTITY * close_price, 2)
+                        })
+
+            elif FREQUENCY == 'weekly':
+                first_sunday = START_DATE + pd.offsets.Week(weekday=6)
+                current_date = first_sunday
+                while current_date <= END_DATE:
+                    if current_date > df['date'].max():
+                        break
+                    week_data = df[df['date'] >= current_date]
+                    if week_data.empty:
+                        break
+                    date_lookup = week_data['date'].min()
+                    close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
+
+                    transactions.append({
+                        "stock": STOCK,
+                        "date": date_lookup.strftime("%Y-%m-%d"),
+                        "action": "buy",
+                        "quantity": FIXED_QUANTITY,
+                        "price": close_price,
+                        "total_cost": round(FIXED_QUANTITY * close_price, 2)
+                    })
+
+                    current_date += timedelta(weeks=1)
+
+            # Save transactions to S3
+            user_id = request.token_info.get("username")  # comes from the token
+
+            file_id = str(uuid.uuid4())
+            file_id_tx = file_id + "_tx.json"
+            user_s3_key = f"user_data/{user_id}/tx/{file_id_tx}"
+
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=user_s3_key,
+                Body=json.dumps(transactions, indent=2),
+                ContentType="application/json"
+            )
+
+            rule_fqr = {
+                "stock": STOCK,
+                'fixed_quantity': FIXED_QUANTITY,
+                "frequency": FREQUENCY, 
+                "start_date": str(START_DATE), 
+                "end_date": str(END_DATE)  
+            }
+
+            file_id_fqr = file_id + "_fqr.json"
+            user_s3_key = f"user_data/{user_id}/fqr/{file_id_fqr}"
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=user_s3_key,
+                Body=json.dumps([rule_fqr], indent=2),
+                ContentType="application/json"
+            )
+
+            message = f"Saved {len(transactions)} {FREQUENCY} buys of {FIXED_QUANTITY} shares for {STOCK} to {user_s3_key}"
+            token = request.form.get("token") or request.args.get("token")
+            return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
+
+        except Exception as e:
+            message = f"Error: {str(e)}"
+
+        return render_template_string(UI_TEMPLATE_FQR, message=message)
+
+    # GET request → show the form
+    return render_template_string(UI_TEMPLATE_FQR, message=None)
+
+
+# Inline HTML UI for FQR
+UI_TEMPLATE_FQR = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Add FQR Rule</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    form { display: flex; flex-direction: column; width: 300px; }
+    label { margin-top: 10px; }
+    button { margin-top: 20px; padding: 10px; background: #4CAF50; color: white; border: none; cursor: pointer; }
+    button:hover { background: #45a049; }
+    .msg { margin-top: 20px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>Add Fixed Quantity Rule</h2>
+  <form method="POST">
+    <label>Stock Symbol:
+      <input type="text" name="stock" value="aapl" required>
+    </label>
+
+    <label>Quantity:
+      <input type="number" name="quantity" value="1" required>
     </label>
 
     <label>Frequency:
