@@ -22,7 +22,8 @@ from token_gen import add_token, delete_token
 from transaction_logger import load_transactions, save_transaction
 from datetime import timedelta
 from transactions import run_transactions
-
+import statsmodels.api as sm
+import base64
 
 
 
@@ -366,6 +367,9 @@ def home():
                   <a class="btn btn-outline-secondary btn-lg" href="{{ url_for('correlation_input', token=token) }}">🔗 Check Correlations (correlation_input)</a>
                   <a class="btn btn-outline-info btn-lg" href="{{ url_for('plot', token=token) }}">📉 Simple Plot (plot)</a>
                   <a class="btn btn-outline-dark btn-lg" href="{{ url_for('stock_data_plot', stock_symbol='AAPL', token=token) }}">🔎 Example: AAPL Data (AAPL_data)</a>
+
+                  <!-- ✅ NEW BUTTON ADDED HERE -->
+                  <a class="btn btn-outline-success btn-lg" href="{{ url_for('pairs_trading', token=token) }}">📊 Pairs Trading </a>
                 </div>
               </div>
             </div>
@@ -387,6 +391,150 @@ def home():
     </body>
     </html>
     """, token=token)
+
+@app.route("/pairs_trading", methods=["GET", "POST"])
+@require_api_token
+def pairs_trading():
+    if request.method == "GET":
+        return render_template_string("""
+        <h2>Pairs Trading Backtest</h2>
+        <form method="post">
+            Ticker 1: <input name="ticker1"><br><br>
+            Ticker 2: <input name="ticker2"><br><br>
+            Start Date (YYYY-MM-DD): <input name="start"><br><br>
+            End Date (YYYY-MM-DD): <input name="end"><br><br>
+            <button type="submit">Run Backtest</button>
+        </form>
+        """)
+
+    # ----- Collect user input -----
+    ticker1 = request.form["ticker1"].upper()
+    ticker2 = request.form["ticker2"].upper()
+    start = request.form["start"]
+    end = request.form["end"]
+
+    # ----- Load both tickers directly from S3 -----
+    S3_BUCKET = "stonks-1"
+    S3_PREFIX = "stock_data/"
+    s3 = boto3.client("s3")
+
+    df_list = {}
+    for ticker in [ticker1, ticker2]:
+        key = f"{S3_PREFIX}{ticker.lower()}_data.json"
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        data = json.loads(obj["Body"].read().decode("utf-8"))
+        df_temp = pd.DataFrame(data)
+        df_temp["date"] = pd.to_datetime(df_temp["date"])
+        df_temp = df_temp.set_index("date")
+        df_list[ticker] = df_temp["close"]
+
+    # ----- Merge -----
+    df = pd.concat([df_list[ticker1], df_list[ticker2]], axis=1)
+    df.columns = [ticker1, ticker2]
+    df = df.loc[start:end].dropna()
+
+    # ----- Cointegration test -----
+    coint_t, p_value, crit = sm.tsa.stattools.coint(df[ticker1], df[ticker2])
+
+    coint_result = (
+        f"Cointegration p-value: {p_value:.4f} — GOOD PAIR"
+        if p_value < 0.05
+        else f"Cointegration p-value: {p_value:.4f} — NOT COINTEGRATED"
+    )
+
+    # ----- Hedge ratio & spread -----
+    X = sm.add_constant(df[ticker2])
+    model = sm.OLS(df[ticker1], X).fit()
+    hedge_ratio = model.params[ticker2]
+
+    df["spread"] = df[ticker1] - hedge_ratio * df[ticker2]
+
+    # ----- Rolling z-score -----
+    window = 30
+    df["spread_mean"] = df["spread"].rolling(window).mean()
+    df["spread_std"] = df["spread"].rolling(window).std()
+    df["zscore"] = (df["spread"] - df["spread_mean"]) / df["spread_std"]
+
+    # ----- MA confirmation -----
+    df["ma_short"] = df["spread"].rolling(10).mean()
+    df["ma_long"] = df["spread"].rolling(50).mean()
+
+    # ----- Signals -----
+    entry, exit = 2.0, 0.5
+    df["long_signal"] = ((df["zscore"] < -entry) & (df["ma_short"] < df["ma_long"])).astype(int)
+    df["short_signal"] = ((df["zscore"] > entry) & (df["ma_short"] > df["ma_long"])).astype(int)
+    df["exit_signal"] = (abs(df["zscore"]) < exit).astype(int)
+
+    # ----- Position -----
+    df["position"] = 0
+    df.loc[df["long_signal"] == 1, "position"] = 1
+    df.loc[df["short_signal"] == 1, "position"] = -1
+    df.loc[df["exit_signal"] == 1, "position"] = 0
+    df["position"] = df["position"].replace(to_replace=0, method="ffill")
+
+    # ----- Strategy returns -----
+    df["returns"] = df[ticker1].pct_change() - hedge_ratio * df[ticker2].pct_change()
+    df["strategy"] = df["position"].shift(1) * df["returns"]
+    cum_ret = (1 + df["strategy"].fillna(0)).cumprod().iloc[-1]
+
+    # ========== PLOTS → BASE64 STRINGS (inline) ==========
+
+    # --- Plot 1: Spread & MAs ---
+    plt.figure(figsize=(10,5))
+    plt.plot(df.index, df["spread"], label="Spread")
+    plt.plot(df.index, df["ma_short"], label="10-day MA")
+    plt.plot(df.index, df["ma_long"], label="50-day MA")
+    plt.legend()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    img1 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close()
+
+    # --- Plot 2: Z-score ---
+    plt.figure(figsize=(10,5))
+    plt.plot(df.index, df["zscore"], label="Z-score")
+    plt.axhline(2, linestyle="--")
+    plt.axhline(-2, linestyle="--")
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    img2 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close()
+
+    # --- Plot 3: Cumulative return ---
+    plt.figure(figsize=(10,5))
+    plt.plot((1 + df["strategy"].fillna(0)).cumprod(), label="Cumulative Return")
+    plt.legend()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    img3 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close()
+
+    # ----- Render HTML -----
+    return render_template_string("""
+        <h2>Pairs Trading Results: {{t1}} vs {{t2}}</h2>
+
+        <p><b>{{coint}}</b></p>
+        <p><b>Final Cumulative Return: {{ret}}</b></p>
+
+        <h3>Spread & Moving Averages</h3>
+        <img src="data:image/png;base64,{{img1}}">
+
+        <h3>Z-score</h3>
+        <img src="data:image/png;base64,{{img2}}">
+
+        <h3>Strategy Performance</h3>
+        <img src="data:image/png;base64,{{img3}}">
+
+        <br><br>
+        <a href="/pairs_trading">Run Another Backtest</a>
+    """, 
+    t1=ticker1, t2=ticker2,
+    coint=coint_result,
+    ret=f"{cum_ret:.2f}",
+    img1=img1, img2=img2, img3=img3)
 
 
 @app.route('/plot')
