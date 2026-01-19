@@ -24,6 +24,8 @@ from datetime import timedelta
 from transactions import run_transactions
 import statsmodels.api as sm
 import base64
+import re
+from botocore.exceptions import ClientError
 
 
 
@@ -927,44 +929,172 @@ def transactions():
 
 
 
+# -------- helpers (small, local) --------
+def _sanitize_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        return ""
+    name = re.sub(r"\s+", "_", name)
+    name = re.sub(r"[^a-zA-Z0-9_-]", "", name)
+    return name
+
+def _s3_exists(s3_client, bucket: str, key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            return False
+        raise
+
+def _list_rule_files(s3_client, bucket: str, prefix: str):
+    # Returns list of filenames (not full keys)
+    resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    contents = resp.get("Contents", [])
+    out = []
+    for obj in contents:
+        key = obj.get("Key", "")
+        if not key or key.endswith("/"):
+            continue
+        out.append(key.split("/")[-1])
+    out.sort()
+    return out
+
+
+# =========================
+# DCA RULES
+# =========================
+
 @app.route('/dca_rule', methods=['GET', 'POST'])
 @require_api_token
 def dca_rule():
-    if request.method == 'POST':
+    S3_BUCKET = 'stonks-1'
+    s3_client = boto3.client('s3')
+    user_id = request.token_info.get("username")
+
+    dca_prefix = f"user_data/{user_id}/dca/"
+    tx_prefix  = f"user_data/{user_id}/tx/"
+
+    message = None
+    error = None
+
+    # Which rule is selected (from query param or hidden form field)
+    selected_rule = request.args.get("selected_rule") or request.form.get("selected_rule") or ""
+
+    # Load list of rules
+    rule_files = _list_rule_files(s3_client, S3_BUCKET, dca_prefix)
+
+    # Load selected rule JSON (if any)
+    selected_rule_json = None
+    if selected_rule:
+        selected_key = dca_prefix + selected_rule
         try:
-            STOCK = request.form.get("stock", "aapl")
-            FIXED_DOLLAR_AMOUNT = float(request.form.get("dollar_amount", 100))
-            FREQUENCY = request.form.get("frequency", "weekly")
-            START_DATE = pd.to_datetime(request.form.get("start_date", "2020-01-01"), utc=True)
-            END_DATE   = pd.to_datetime(request.form.get("end_date", "2025-01-01"), utc=True)
+            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=selected_key)
+            selected_rule_json = obj['Body'].read().decode('utf-8')
+        except Exception as e:
+            error = f"Error loading selected rule: {str(e)}"
+            selected_rule = ""
+            selected_rule_json = None
 
-            # Load stock data from S3
-            S3_BUCKET = 'stonks-1'
-            S3_PREFIX = 'stock_data/'
-            s3_client = boto3.client('s3')
-            s3_key = f"{S3_PREFIX}{STOCK}_data.json"
-            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
-            stock_data = json.loads(obj['Body'].read().decode('utf-8'))
-            df = pd.DataFrame(stock_data)
-            df['date'] = pd.to_datetime(df['date'], utc=True)
-            df = df.sort_values(by='date').reset_index(drop=True)
+    # Handle Apply/Delete on POST
+    if request.method == 'POST':
+        action = request.form.get("action", "")
 
-            # Initialize new transaction list
-            transactions = []
+        if not selected_rule:
+            error = "Please select a rule first."
+            return render_template_string(
+                UI_TEMPLATE_DCA_MAIN,
+                message=message,
+                error=error,
+                rules=rule_files,
+                selected_rule=selected_rule,
+                selected_rule_json=selected_rule_json
+            )
 
-            start_year = START_DATE.year
-            end_year = END_DATE.year
+        selected_key = dca_prefix + selected_rule
 
-            if FREQUENCY == 'monthly':
-                for year in range(start_year, end_year + 1):
-                    for month in range(1, 13):
-                        target_date = pd.Timestamp(year=year, month=month, day=1, tz='UTC')
-                        if target_date < df['date'].min() or target_date > df['date'].max():
-                            continue
-                        month_data = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
-                        if month_data.empty:
-                            continue
-                        date_lookup = month_data['date'].min()
+        if action == "delete":
+            try:
+                s3_client.delete_object(Bucket=S3_BUCKET, Key=selected_key)
+                message = f"Deleted rule: {selected_rule}"
+                # refresh list and clear selection
+                rule_files = _list_rule_files(s3_client, S3_BUCKET, dca_prefix)
+                selected_rule = ""
+                selected_rule_json = None
+            except Exception as e:
+                error = f"Error deleting rule: {str(e)}"
+
+            return render_template_string(
+                UI_TEMPLATE_DCA_MAIN,
+                message=message,
+                error=error,
+                rules=rule_files,
+                selected_rule=selected_rule,
+                selected_rule_json=selected_rule_json
+            )
+
+        if action == "apply":
+            try:
+                # Load rule params from selected file (your rule is stored as [rule_obj])
+                obj = s3_client.get_object(Bucket=S3_BUCKET, Key=selected_key)
+                rule_data = json.loads(obj['Body'].read().decode('utf-8'))
+                if isinstance(rule_data, list) and len(rule_data) > 0:
+                    rule_dca = rule_data[0]
+                elif isinstance(rule_data, dict):
+                    rule_dca = rule_data
+                else:
+                    raise ValueError("Rule file is empty or invalid JSON.")
+
+                STOCK = rule_dca.get("stock", "aapl")
+                FIXED_DOLLAR_AMOUNT = float(rule_dca.get("fixed_dollar_amount", 100))
+                FREQUENCY = rule_dca.get("frequency", "weekly")
+                START_DATE = pd.to_datetime(rule_dca.get("start_date", "2020-01-01"), utc=True)
+                END_DATE   = pd.to_datetime(rule_dca.get("end_date", "2025-01-01"), utc=True)
+
+                # Load stock data from S3 (same as your existing code)
+                S3_PREFIX = 'stock_data/'
+                s3_key = f"{S3_PREFIX}{STOCK}_data.json"
+                obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+                stock_data = json.loads(obj['Body'].read().decode('utf-8'))
+                df = pd.DataFrame(stock_data)
+                df['date'] = pd.to_datetime(df['date'], utc=True)
+                df = df.sort_values(by='date').reset_index(drop=True)
+
+                # Build transactions (same logic as before)
+                transactions = []
+                start_year = START_DATE.year
+                end_year = END_DATE.year
+
+                if FREQUENCY == 'monthly':
+                    for year in range(start_year, end_year + 1):
+                        for month in range(1, 13):
+                            target_date = pd.Timestamp(year=year, month=month, day=1, tz='UTC')
+                            if target_date < df['date'].min() or target_date > df['date'].max():
+                                continue
+                            month_data = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
+                            if month_data.empty:
+                                continue
+                            date_lookup = month_data['date'].min()
+                            close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
+                            quantity = round(FIXED_DOLLAR_AMOUNT / close_price, 6)
+
+                            transactions.append({
+                                "stock": STOCK,
+                                "date": date_lookup.strftime("%Y-%m-%d"),
+                                "action": "buy",
+                                "quantity": quantity
+                            })
+
+                elif FREQUENCY == 'weekly':
+                    first_sunday = START_DATE + pd.offsets.Week(weekday=6)
+                    current_date = first_sunday
+                    while current_date <= END_DATE:
+                        if current_date > df['date'].max():
+                            break
+                        week_data = df[df['date'] >= current_date]
+                        if week_data.empty:
+                            break
+                        date_lookup = week_data['date'].min()
                         close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
                         quantity = round(FIXED_DOLLAR_AMOUNT / close_price, 6)
 
@@ -975,90 +1105,205 @@ def dca_rule():
                             "quantity": quantity
                         })
 
-            elif FREQUENCY == 'weekly':
-                first_sunday = START_DATE + pd.offsets.Week(weekday=6)
-                current_date = first_sunday
-                while current_date <= END_DATE:
-                    if current_date > df['date'].max():
-                        break
-                    week_data = df[df['date'] >= current_date]
-                    if week_data.empty:
-                        break
-                    date_lookup = week_data['date'].min()
-                    close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
-                    quantity = round(FIXED_DOLLAR_AMOUNT / close_price, 6)
+                        current_date += timedelta(weeks=1)
 
-                    transactions.append({
-                        "stock": STOCK,
-                        "date": date_lookup.strftime("%Y-%m-%d"),
-                        "action": "buy",
-                        "quantity": quantity
-                    })
+                # Save tx file (UUID name; you can later add optional naming here too if you want)
+                file_id = str(uuid.uuid4())
+                file_id_tx = file_id + "_tx.json"
+                tx_key = tx_prefix + file_id_tx
 
-                    current_date += timedelta(weeks=1)
+                s3_client.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=tx_key,
+                    Body=json.dumps(transactions, indent=2),
+                    ContentType="application/json"
+                )
 
-            # Save transactions to S3
-            user_id = request.token_info.get("username")  # comes from the token
+                token = request.form.get("token") or request.args.get("token")
+                return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
 
-            file_id = str(uuid.uuid4())
-            file_id_tx = file_id + "_tx.json"
-            user_s3_key = f"user_data/{user_id}/tx/{file_id_tx}"
+            except Exception as e:
+                error = f"Error applying rule: {str(e)}"
 
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=user_s3_key,
-                Body=json.dumps(transactions, indent=2),
-                ContentType="application/json"
+            return render_template_string(
+                UI_TEMPLATE_DCA_MAIN,
+                message=message,
+                error=error,
+                rules=rule_files,
+                selected_rule=selected_rule,
+                selected_rule_json=selected_rule_json
             )
+
+    # GET → show main page
+    return render_template_string(
+        UI_TEMPLATE_DCA_MAIN,
+        message=message,
+        error=error,
+        rules=rule_files,
+        selected_rule=selected_rule,
+        selected_rule_json=selected_rule_json
+    )
+
+
+@app.route('/dca_rule/new', methods=['GET', 'POST'])
+@require_api_token
+def dca_rule_new():
+    if request.method == 'POST':
+        try:
+            STOCK = request.form.get("stock", "aapl")
+            FIXED_DOLLAR_AMOUNT = float(request.form.get("dollar_amount", 100))
+            FREQUENCY = request.form.get("frequency", "weekly")
+            START_DATE = pd.to_datetime(request.form.get("start_date", "2020-01-01"), utc=True)
+            END_DATE   = pd.to_datetime(request.form.get("end_date", "2025-01-01"), utc=True)
+
+            # Save only the rule (no tx generation here)
+            S3_BUCKET = 'stonks-1'
+            s3_client = boto3.client('s3')
+            user_id = request.token_info.get("username")
+
+            desired_name_raw = request.form.get("file_name", "").strip()
+            desired_name = _sanitize_name(desired_name_raw)
+
+            if desired_name_raw and not desired_name:
+                message = "Error: Invalid file name. Use only letters, numbers, underscores, or dashes."
+                return render_template_string(UI_TEMPLATE_DCA_NEW, message=message)
+
+            if desired_name:
+                file_id = desired_name
+            else:
+                file_id = str(uuid.uuid4())
+
+            file_id_dca = file_id + "_dca.json"
+            dca_key = f"user_data/{user_id}/dca/{file_id_dca}"
+
+            # collision check only if user typed a name
+            if desired_name and _s3_exists(s3_client, S3_BUCKET, dca_key):
+                message = "Error: A rule with that name already exists. Please choose a different name."
+                return render_template_string(UI_TEMPLATE_DCA_NEW, message=message)
 
             rule_dca = {
                 "stock": STOCK,
-                'fixed_dollar_amount': FIXED_DOLLAR_AMOUNT,
-                "frequency": FREQUENCY, 
-                "start_date": str(START_DATE), 
-                "end_date": str(END_DATE)  
+                "fixed_dollar_amount": FIXED_DOLLAR_AMOUNT,
+                "frequency": FREQUENCY,
+                "start_date": str(START_DATE),
+                "end_date": str(END_DATE)
             }
 
-            file_id_dca = file_id + "_dca.json"
-            user_s3_key = f"user_data/{user_id}/dca/{file_id_dca}"
             s3_client.put_object(
                 Bucket=S3_BUCKET,
-                Key=user_s3_key,
+                Key=dca_key,
                 Body=json.dumps([rule_dca], indent=2),
                 ContentType="application/json"
             )
 
-            message = f"Saved {len(transactions)} {FREQUENCY} buys of ${FIXED_DOLLAR_AMOUNT} for {STOCK} to {user_s3_key}"
             token = request.form.get("token") or request.args.get("token")
-            return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
+            return redirect(url_for("dca_rule", token=token, selected_rule=file_id_dca))
 
         except Exception as e:
             message = f"Error: {str(e)}"
+            return render_template_string(UI_TEMPLATE_DCA_NEW, message=message)
 
-        return render_template_string(UI_TEMPLATE, message=message)
-
-    # GET request → show the form
-    return render_template_string(UI_TEMPLATE, message=None)
+    return render_template_string(UI_TEMPLATE_DCA_NEW, message=None)
 
 
-# Inline HTML UI
-UI_TEMPLATE = """
+UI_TEMPLATE_DCA_MAIN = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>DCA Rules</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    .wrap { display: flex; gap: 40px; align-items: flex-start; }
+    .left { width: 280px; }
+    .right { flex: 1; }
+    .rules { padding: 10px; border: 1px solid #ccc; }
+    .rules a { display: block; padding: 4px 0; text-decoration: none; color: #000; }
+    .rules a.selected { font-weight: bold; text-decoration: underline; }
+    textarea { width: 100%; height: 220px; font-family: monospace; }
+    .btnrow { display: flex; gap: 10px; margin-top: 16px; }
+    .btn { padding: 12px 16px; border: none; cursor: pointer; font-weight: bold; }
+    .btn-green { background: #93c47d; }
+    .btn-red { background: #ff0000; color: white; }
+    .btn:hover { opacity: 0.9; }
+    .msg { margin-top: 18px; font-weight: bold; }
+    .err { margin-top: 18px; font-weight: bold; color: red; }
+    .add { margin-top: 14px; display: inline-block; padding: 10px 14px; background: #93c47d; font-weight: bold; text-decoration: none; color: black; }
+  </style>
+</head>
+<body>
+  <h2>Existing DCA Rules</h2>
+
+  <div class="wrap">
+    <div class="left">
+      <div><b>Filter:</b></div>
+      <div class="rules">
+        {% for r in rules %}
+          <a href="{{ url_for('dca_rule', token=request.args.get('token'), selected_rule=r) }}"
+             class="{% if r == selected_rule %}selected{% endif %}">
+             {{ r }}
+          </a>
+        {% endfor %}
+        {% if rules|length == 0 %}
+          <div style="color:#666;">No rules found.</div>
+        {% endif %}
+      </div>
+
+      <a class="add" href="{{ url_for('dca_rule_new', token=request.args.get('token')) }}">Add New DCA Rule</a>
+    </div>
+
+    <div class="right">
+      <h3>Rule params:</h3>
+
+      {% if selected_rule_json %}
+        <textarea readonly>{{ selected_rule_json }}</textarea>
+      {% else %}
+        <textarea readonly>[]</textarea>
+      {% endif %}
+
+      <form method="POST">
+        <input type="hidden" name="selected_rule" value="{{ selected_rule }}">
+        <input type="hidden" name="token" value="{{ request.args.get('token','') }}">
+
+        <div class="btnrow">
+          <button class="btn btn-green" type="submit" name="action" value="apply">Apply Rule</button>
+          <button class="btn btn-red" type="submit" name="action" value="delete">Delete Rule</button>
+        </div>
+      </form>
+
+      {% if error %}
+        <div class="err">{{ error }}</div>
+      {% endif %}
+      {% if message %}
+        <div class="msg">{{ message }}</div>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+UI_TEMPLATE_DCA_NEW = """
 <!DOCTYPE html>
 <html>
 <head>
   <title>Add DCA Rule</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 2em; }
-    form { display: flex; flex-direction: column; width: 300px; }
+    form { display: flex; flex-direction: column; width: 320px; }
     label { margin-top: 10px; }
-    button { margin-top: 20px; padding: 10px; background: #4CAF50; color: white; border: none; cursor: pointer; }
-    button:hover { background: #45a049; }
+    button { margin-top: 20px; padding: 10px; background: #93c47d; font-weight: bold; border: none; cursor: pointer; }
+    button:hover { opacity: 0.9; }
     .msg { margin-top: 20px; font-weight: bold; }
+    a { display: inline-block; margin-top: 18px; }
   </style>
 </head>
 <body>
   <h2>Add DCA Investment Rule</h2>
+
   <form method="POST">
+    <input type="hidden" name="token" value="{{ request.args.get('token','') }}">
+
     <label>Stock Symbol:
       <input type="text" name="stock" value="aapl" required>
     </label>
@@ -1082,54 +1327,151 @@ UI_TEMPLATE = """
       <input type="date" name="end_date" value="2025-01-01" required>
     </label>
 
-    <button type="submit">Apply Rule</button>
+    <label>Optional File Name:
+      <input type="text" name="file_name" placeholder="Leave blank for auto-name">
+    </label>
+
+    <button type="submit">Add Rule</button>
   </form>
 
   {% if message %}
-  <div class="msg">{{ message }}</div>
+    <div class="msg">{{ message }}</div>
   {% endif %}
+
+  <a href="{{ url_for('dca_rule', token=request.args.get('token')) }}">Back to DCA rules</a>
 </body>
 </html>
 """
 
+
+# =========================
+# FQR RULES
+# =========================
+
 @app.route('/fqr_rule', methods=['GET', 'POST'])
 @require_api_token
 def fqr_rule():
-    if request.method == 'POST':
+    S3_BUCKET = 'stonks-1'
+    s3_client = boto3.client('s3')
+    user_id = request.token_info.get("username")
+
+    fqr_prefix = f"user_data/{user_id}/fqr/"
+    tx_prefix  = f"user_data/{user_id}/tx/"
+
+    message = None
+    error = None
+
+    selected_rule = request.args.get("selected_rule") or request.form.get("selected_rule") or ""
+
+    rule_files = _list_rule_files(s3_client, S3_BUCKET, fqr_prefix)
+
+    selected_rule_json = None
+    if selected_rule:
+        selected_key = fqr_prefix + selected_rule
         try:
-            STOCK = request.form.get("stock", "aapl")
-            FIXED_QUANTITY = float(request.form.get("quantity", 1))
-            FREQUENCY = request.form.get("frequency", "weekly")
-            START_DATE = pd.to_datetime(request.form.get("start_date", "2020-01-01"), utc=True)
-            END_DATE   = pd.to_datetime(request.form.get("end_date", "2025-01-01"), utc=True)
+            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=selected_key)
+            selected_rule_json = obj['Body'].read().decode('utf-8')
+        except Exception as e:
+            error = f"Error loading selected rule: {str(e)}"
+            selected_rule = ""
+            selected_rule_json = None
 
-            # Load stock data from S3
-            S3_BUCKET = 'stonks-1'
-            S3_PREFIX = 'stock_data/'
-            s3_client = boto3.client('s3')
-            s3_key = f"{S3_PREFIX}{STOCK}_data.json"
-            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
-            stock_data = json.loads(obj['Body'].read().decode('utf-8'))
-            df = pd.DataFrame(stock_data)
-            df['date'] = pd.to_datetime(df['date'], utc=True)
-            df = df.sort_values(by='date').reset_index(drop=True)
+    if request.method == 'POST':
+        action = request.form.get("action", "")
 
-            # Initialize new transaction list
-            transactions = []
+        if not selected_rule:
+            error = "Please select a rule first."
+            return render_template_string(
+                UI_TEMPLATE_FQR_MAIN,
+                message=message,
+                error=error,
+                rules=rule_files,
+                selected_rule=selected_rule,
+                selected_rule_json=selected_rule_json
+            )
 
-            start_year = START_DATE.year
-            end_year = END_DATE.year
+        selected_key = fqr_prefix + selected_rule
 
-            if FREQUENCY == 'monthly':
-                for year in range(start_year, end_year + 1):
-                    for month in range(1, 13):
-                        target_date = pd.Timestamp(year=year, month=month, day=1, tz='UTC')
-                        if target_date < df['date'].min() or target_date > df['date'].max():
-                            continue
-                        month_data = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
-                        if month_data.empty:
-                            continue
-                        date_lookup = month_data['date'].min()
+        if action == "delete":
+            try:
+                s3_client.delete_object(Bucket=S3_BUCKET, Key=selected_key)
+                message = f"Deleted rule: {selected_rule}"
+                rule_files = _list_rule_files(s3_client, S3_BUCKET, fqr_prefix)
+                selected_rule = ""
+                selected_rule_json = None
+            except Exception as e:
+                error = f"Error deleting rule: {str(e)}"
+
+            return render_template_string(
+                UI_TEMPLATE_FQR_MAIN,
+                message=message,
+                error=error,
+                rules=rule_files,
+                selected_rule=selected_rule,
+                selected_rule_json=selected_rule_json
+            )
+
+        if action == "apply":
+            try:
+                obj = s3_client.get_object(Bucket=S3_BUCKET, Key=selected_key)
+                rule_data = json.loads(obj['Body'].read().decode('utf-8'))
+                if isinstance(rule_data, list) and len(rule_data) > 0:
+                    rule_fqr = rule_data[0]
+                elif isinstance(rule_data, dict):
+                    rule_fqr = rule_data
+                else:
+                    raise ValueError("Rule file is empty or invalid JSON.")
+
+                STOCK = rule_fqr.get("stock", "aapl")
+                FIXED_QUANTITY = float(rule_fqr.get("fixed_quantity", 1))
+                FREQUENCY = rule_fqr.get("frequency", "weekly")
+                START_DATE = pd.to_datetime(rule_fqr.get("start_date", "2020-01-01"), utc=True)
+                END_DATE   = pd.to_datetime(rule_fqr.get("end_date", "2025-01-01"), utc=True)
+
+                # Load stock data from S3
+                S3_PREFIX = 'stock_data/'
+                s3_key = f"{S3_PREFIX}{STOCK}_data.json"
+                obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+                stock_data = json.loads(obj['Body'].read().decode('utf-8'))
+                df = pd.DataFrame(stock_data)
+                df['date'] = pd.to_datetime(df['date'], utc=True)
+                df = df.sort_values(by='date').reset_index(drop=True)
+
+                transactions = []
+                start_year = START_DATE.year
+                end_year = END_DATE.year
+
+                if FREQUENCY == 'monthly':
+                    for year in range(start_year, end_year + 1):
+                        for month in range(1, 13):
+                            target_date = pd.Timestamp(year=year, month=month, day=1, tz='UTC')
+                            if target_date < df['date'].min() or target_date > df['date'].max():
+                                continue
+                            month_data = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
+                            if month_data.empty:
+                                continue
+                            date_lookup = month_data['date'].min()
+                            close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
+
+                            transactions.append({
+                                "stock": STOCK,
+                                "date": date_lookup.strftime("%Y-%m-%d"),
+                                "action": "buy",
+                                "quantity": FIXED_QUANTITY,
+                                "price": close_price,
+                                "total_cost": round(FIXED_QUANTITY * close_price, 2)
+                            })
+
+                elif FREQUENCY == 'weekly':
+                    first_sunday = START_DATE + pd.offsets.Week(weekday=6)
+                    current_date = first_sunday
+                    while current_date <= END_DATE:
+                        if current_date > df['date'].max():
+                            break
+                        week_data = df[df['date'] >= current_date]
+                        if week_data.empty:
+                            break
+                        date_lookup = week_data['date'].min()
                         close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
 
                         transactions.append({
@@ -1141,91 +1483,201 @@ def fqr_rule():
                             "total_cost": round(FIXED_QUANTITY * close_price, 2)
                         })
 
-            elif FREQUENCY == 'weekly':
-                first_sunday = START_DATE + pd.offsets.Week(weekday=6)
-                current_date = first_sunday
-                while current_date <= END_DATE:
-                    if current_date > df['date'].max():
-                        break
-                    week_data = df[df['date'] >= current_date]
-                    if week_data.empty:
-                        break
-                    date_lookup = week_data['date'].min()
-                    close_price = df.loc[df['date'] == date_lookup, 'close'].iloc[0]
+                        current_date += timedelta(weeks=1)
 
-                    transactions.append({
-                        "stock": STOCK,
-                        "date": date_lookup.strftime("%Y-%m-%d"),
-                        "action": "buy",
-                        "quantity": FIXED_QUANTITY,
-                        "price": close_price,
-                        "total_cost": round(FIXED_QUANTITY * close_price, 2)
-                    })
+                file_id = str(uuid.uuid4())
+                file_id_tx = file_id + "_tx.json"
+                tx_key = tx_prefix + file_id_tx
 
-                    current_date += timedelta(weeks=1)
+                s3_client.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=tx_key,
+                    Body=json.dumps(transactions, indent=2),
+                    ContentType="application/json"
+                )
 
-            # Save transactions to S3
-            user_id = request.token_info.get("username")  # comes from the token
+                token = request.form.get("token") or request.args.get("token")
+                return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
 
-            file_id = str(uuid.uuid4())
-            file_id_tx = file_id + "_tx.json"
-            user_s3_key = f"user_data/{user_id}/tx/{file_id_tx}"
+            except Exception as e:
+                error = f"Error applying rule: {str(e)}"
 
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=user_s3_key,
-                Body=json.dumps(transactions, indent=2),
-                ContentType="application/json"
+            return render_template_string(
+                UI_TEMPLATE_FQR_MAIN,
+                message=message,
+                error=error,
+                rules=rule_files,
+                selected_rule=selected_rule,
+                selected_rule_json=selected_rule_json
             )
+
+    return render_template_string(
+        UI_TEMPLATE_FQR_MAIN,
+        message=message,
+        error=error,
+        rules=rule_files,
+        selected_rule=selected_rule,
+        selected_rule_json=selected_rule_json
+    )
+
+
+@app.route('/fqr_rule/new', methods=['GET', 'POST'])
+@require_api_token
+def fqr_rule_new():
+    if request.method == 'POST':
+        try:
+            STOCK = request.form.get("stock", "aapl")
+            FIXED_QUANTITY = float(request.form.get("quantity", 1))
+            FREQUENCY = request.form.get("frequency", "weekly")
+            START_DATE = pd.to_datetime(request.form.get("start_date", "2020-01-01"), utc=True)
+            END_DATE   = pd.to_datetime(request.form.get("end_date", "2025-01-01"), utc=True)
+
+            S3_BUCKET = 'stonks-1'
+            s3_client = boto3.client('s3')
+            user_id = request.token_info.get("username")
+
+            desired_name_raw = request.form.get("file_name", "").strip()
+            desired_name = _sanitize_name(desired_name_raw)
+
+            if desired_name_raw and not desired_name:
+                message = "Error: Invalid file name. Use only letters, numbers, underscores, or dashes."
+                return render_template_string(UI_TEMPLATE_FQR_NEW, message=message)
+
+            if desired_name:
+                file_id = desired_name
+            else:
+                file_id = str(uuid.uuid4())
+
+            file_id_fqr = file_id + "_fqr.json"
+            fqr_key = f"user_data/{user_id}/fqr/{file_id_fqr}"
+
+            if desired_name and _s3_exists(s3_client, S3_BUCKET, fqr_key):
+                message = "Error: A rule with that name already exists. Please choose a different name."
+                return render_template_string(UI_TEMPLATE_FQR_NEW, message=message)
 
             rule_fqr = {
                 "stock": STOCK,
-                'fixed_quantity': FIXED_QUANTITY,
-                "frequency": FREQUENCY, 
-                "start_date": str(START_DATE), 
-                "end_date": str(END_DATE)  
+                "fixed_quantity": FIXED_QUANTITY,
+                "frequency": FREQUENCY,
+                "start_date": str(START_DATE),
+                "end_date": str(END_DATE)
             }
 
-            file_id_fqr = file_id + "_fqr.json"
-            user_s3_key = f"user_data/{user_id}/fqr/{file_id_fqr}"
             s3_client.put_object(
                 Bucket=S3_BUCKET,
-                Key=user_s3_key,
+                Key=fqr_key,
                 Body=json.dumps([rule_fqr], indent=2),
                 ContentType="application/json"
             )
 
-            message = f"Saved {len(transactions)} {FREQUENCY} buys of {FIXED_QUANTITY} shares for {STOCK} to {user_s3_key}"
             token = request.form.get("token") or request.args.get("token")
-            return redirect(url_for("transactions", token=token, selected_file=file_id_tx))
+            return redirect(url_for("fqr_rule", token=token, selected_rule=file_id_fqr))
 
         except Exception as e:
             message = f"Error: {str(e)}"
+            return render_template_string(UI_TEMPLATE_FQR_NEW, message=message)
 
-        return render_template_string(UI_TEMPLATE_FQR, message=message)
-
-    # GET request → show the form
-    return render_template_string(UI_TEMPLATE_FQR, message=None)
+    return render_template_string(UI_TEMPLATE_FQR_NEW, message=None)
 
 
-# Inline HTML UI for FQR
-UI_TEMPLATE_FQR = """
+UI_TEMPLATE_FQR_MAIN = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>FQR Rules</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    .wrap { display: flex; gap: 40px; align-items: flex-start; }
+    .left { width: 280px; }
+    .right { flex: 1; }
+    .rules { padding: 10px; border: 1px solid #ccc; }
+    .rules a { display: block; padding: 4px 0; text-decoration: none; color: #000; }
+    .rules a.selected { font-weight: bold; text-decoration: underline; }
+    textarea { width: 100%; height: 220px; font-family: monospace; }
+    .btnrow { display: flex; gap: 10px; margin-top: 16px; }
+    .btn { padding: 12px 16px; border: none; cursor: pointer; font-weight: bold; }
+    .btn-green { background: #93c47d; }
+    .btn-red { background: #ff0000; color: white; }
+    .btn:hover { opacity: 0.9; }
+    .msg { margin-top: 18px; font-weight: bold; }
+    .err { margin-top: 18px; font-weight: bold; color: red; }
+    .add { margin-top: 14px; display: inline-block; padding: 10px 14px; background: #93c47d; font-weight: bold; text-decoration: none; color: black; }
+  </style>
+</head>
+<body>
+  <h2>Existing FQR Rules</h2>
+
+  <div class="wrap">
+    <div class="left">
+      <div><b>Filter:</b></div>
+      <div class="rules">
+        {% for r in rules %}
+          <a href="{{ url_for('fqr_rule', token=request.args.get('token'), selected_rule=r) }}"
+             class="{% if r == selected_rule %}selected{% endif %}">
+             {{ r }}
+          </a>
+        {% endfor %}
+        {% if rules|length == 0 %}
+          <div style="color:#666;">No rules found.</div>
+        {% endif %}
+      </div>
+
+      <a class="add" href="{{ url_for('fqr_rule_new', token=request.args.get('token')) }}">Add New FQR Rule</a>
+    </div>
+
+    <div class="right">
+      <h3>Rule params:</h3>
+
+      {% if selected_rule_json %}
+        <textarea readonly>{{ selected_rule_json }}</textarea>
+      {% else %}
+        <textarea readonly>[]</textarea>
+      {% endif %}
+
+      <form method="POST">
+        <input type="hidden" name="selected_rule" value="{{ selected_rule }}">
+        <input type="hidden" name="token" value="{{ request.args.get('token','') }}">
+
+        <div class="btnrow">
+          <button class="btn btn-green" type="submit" name="action" value="apply">Apply Rule</button>
+          <button class="btn btn-red" type="submit" name="action" value="delete">Delete Rule</button>
+        </div>
+      </form>
+
+      {% if error %}
+        <div class="err">{{ error }}</div>
+      {% endif %}
+      {% if message %}
+        <div class="msg">{{ message }}</div>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+UI_TEMPLATE_FQR_NEW = """
 <!DOCTYPE html>
 <html>
 <head>
   <title>Add FQR Rule</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 2em; }
-    form { display: flex; flex-direction: column; width: 300px; }
+    form { display: flex; flex-direction: column; width: 320px; }
     label { margin-top: 10px; }
-    button { margin-top: 20px; padding: 10px; background: #4CAF50; color: white; border: none; cursor: pointer; }
-    button:hover { background: #45a049; }
+    button { margin-top: 20px; padding: 10px; background: #93c47d; font-weight: bold; border: none; cursor: pointer; }
+    button:hover { opacity: 0.9; }
     .msg { margin-top: 20px; font-weight: bold; }
+    a { display: inline-block; margin-top: 18px; }
   </style>
 </head>
 <body>
   <h2>Add Fixed Quantity Rule</h2>
+
   <form method="POST">
+    <input type="hidden" name="token" value="{{ request.args.get('token','') }}">
+
     <label>Stock Symbol:
       <input type="text" name="stock" value="aapl" required>
     </label>
@@ -1249,15 +1701,22 @@ UI_TEMPLATE_FQR = """
       <input type="date" name="end_date" value="2025-01-01" required>
     </label>
 
-    <button type="submit">Apply Rule</button>
+    <label>Optional File Name:
+      <input type="text" name="file_name" placeholder="Leave blank for auto-name">
+    </label>
+
+    <button type="submit">Add Rule</button>
   </form>
 
   {% if message %}
-  <div class="msg">{{ message }}</div>
+    <div class="msg">{{ message }}</div>
   {% endif %}
+
+  <a href="{{ url_for('fqr_rule', token=request.args.get('token')) }}">Back to FQR rules</a>
 </body>
 </html>
 """
+
 
 if __name__ == '__main__':
     os.makedirs('static', exist_ok=True)
